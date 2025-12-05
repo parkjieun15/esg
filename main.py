@@ -3,6 +3,7 @@
 import os
 import json
 import datetime as dt
+from dateutil.relativedelta import relativedelta # pip install python-dateutil
 
 import streamlit as st
 import pandas as pd
@@ -11,10 +12,15 @@ import faiss
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
+# 파일 실행은 로컬이든 가상환경으로 먼저 접속한다음에 (import 되어있는 패키지는 반드시 다운로드 되어야함. ) 터미널 명령어로 streamlit run main.py하면 실행됨. 
+# 종료하려면 터미널에서 Control + C 누르기.
+
 # ---------------------------------------
 # 0. OpenAI 클라이언트 (환경변수 OPENAI_API_KEY 사용)
+# 환경 변수 등록안되어있으면 첫 번째 코드를 주석으로 변경하고 두 번째 코드를 주석을 제거하여 직접키를 전달.
 # ---------------------------------------
-client = OpenAI()
+# client = OpenAI()
+client = OpenAI(api_key="sk-로 시작하는 api키 붙여넣기.")
 
 
 # ---------------------------------------
@@ -142,7 +148,8 @@ def parse_user_query(query: str):
 
     system_prompt = (
         "너는 한국어 금융·ESG 애널리스트 어시스턴트다. "
-        "사용자의 질문에서 기업명, 기간, ESG 관련 키워드, 사용 의도를 구조화하여 JSON으로만 출력하라."
+        "사용자의 질문에서 기업명, 기간(절대 날짜와 상대 기간 둘 다), ESG 관련 키워드, 사용 의도를 구조화하여 JSON으로만 출력하라."
+        "예: '최근 6개월' 같은 표현은 period에 'recent_6_months'로 넣고, start_date/end_date는 몰라도 되면 null로 둔다."
     )
 
     user_prompt = f"""
@@ -156,6 +163,7 @@ def parse_user_query(query: str):
   "end_date": "YYYY-MM-DD" 또는 null,
   "esg_keywords": ["탄소배출", "환경오염", ...],  // 관련 키워드 3~7개
   "intent": "summary" 또는 "risk_focus" 또는 "comparison" 또는 "other"
+  "period" : "recent_6_months" 또는 "recent_3_months" 또는 "recent_1_year" 또는 null,  // '최근 6개월' 등 상대 기간
 }}
     """
 
@@ -414,19 +422,66 @@ def main():
         query_info = parse_user_query(user_query)
 
     filtered = search_df.copy()
-
     # 2-1) 자연어에서 파악한 기간으로 필터링 (start_date / end_date)
-    if "dt" in filtered.columns:
+    
+    '''if "dt" in filtered.columns:
         if query_info.get("start_date"):
             start_date = pd.to_datetime(query_info["start_date"]).date()
             filtered = filtered[filtered["dt"].dt.date >= start_date]
         if query_info.get("end_date"):
             end_date = pd.to_datetime(query_info["end_date"]).date()
             filtered = filtered[filtered["dt"].dt.date <= end_date]
+        print(f"자연어에서 파악한 기간 : {start_date}, {end_date}")
+    '''
+    # --- 기간 필터링 로직 ---
+    start_date = None
+    end_date = None
 
-    if filtered.empty:
-        st.warning("질의에서 추출한 기간 조건을 적용하니 남는 문서가 없습니다. 질문을 조금 더 넓게 적어보세요.")
-        return
+    today = dt.date.today()   # 오늘 날짜 기준
+    if "dt" in filtered.columns:
+        # 1) GPT가 절대 날짜(start_date / end_date)를 명시적으로 준 경우 우선 사용
+        if query_info.get("start_date"):
+            start_date = pd.to_datetime(query_info["start_date"]).date()
+
+        if query_info.get("end_date"):
+            end_date = pd.to_datetime(query_info["end_date"]).date()
+
+        # 2) GPT가 상대 기간(period)만 준 경우 → 오늘 기준으로 계산
+        period = query_info.get("period")   # 예: "recent_6_months"
+        
+        if start_date is None and end_date is None:
+            if period == "recent_6_months":
+                end_date = today
+                start_date = today - dt.timedelta(days=180)  # 6개월 ≈ 180일
+
+            elif period == "recent_3_months":
+                end_date = today
+                start_date = today - dt.timedelta(days=90)   # 3개월 ≈ 90일
+
+            elif period == "recent_1_year":
+                end_date = today
+                start_date = today - dt.timedelta(days=365)  # 1년
+
+            # 필요하면 추가:
+            # elif period == "recent_7_days": ...
+
+        # 3) 여전히 둘 다 None이면 → 기간 필터 안 걸고 전체 사용 or 기본값 적용
+        if start_date is None and end_date is None:
+            # 기본: 최근 1년만 보기 (원하는 대로 변경 가능)
+            end_date = today
+            start_date = today - dt.timedelta(days=365)
+
+        # --- 실제 필터 적용 ---
+        if start_date:
+            filtered = filtered[filtered["dt"].dt.date >= start_date]
+
+        if end_date:
+            filtered = filtered[filtered["dt"].dt.date <= end_date]
+        
+
+        if filtered.empty:
+            st.warning("질의에서 추출한 기간 조건을 적용하니 남는 문서가 없습니다. 질문을 조금 더 넓게 적어보세요.")
+            return
 
     # -----------------------------
     # 3) TOP-10 문서 선정 및 LLM 정량 분석
